@@ -80,6 +80,13 @@ const (
 	// race the catch-all rule exists to close.
 	envLegacyDNSResolution = "NB_USE_LEGACY_DNS_RESOLUTION"
 
+	// envNRPTUseUpstream enables placing match domains that come from a
+	// nameserver group directly into the NRPT rules with that group's nameserver
+	// addresses, instead of the in-memory resolver address. Disabled by default
+	// (set it to "true" to opt in); the in-memory resolver remains a single point
+	// of failure for these domains while it is off.
+	envNRPTUseUpstream = "NB_NRPT_USE_UPSTREAM"
+
 	dnsPolicyConfigVersionKey           = "Version"
 	dnsPolicyConfigVersionValue         = 2
 	dnsPolicyConfigNameKey              = "Name"
@@ -338,7 +345,41 @@ func (r *registryConfigurator) applyDNSConfig(config HostDNSConfig, stateManager
 
 	r.updateState(stateManager)
 
-	var searchDomains, matchDomains []string
+	// Match domains are grouped by the nameserver set that must answer them.
+	// Domains that came from a nameserver group carry that group's upstream
+	// addresses and can be sent directly to them; NetBird's own names (peer
+	// FQDN and reverse zones) have no upstream and keep the in-memory resolver
+	// address. Sending group domains straight to their nameservers avoids
+	// depending on the in-memory resolver, which on userspace interfaces is a
+	// single point of failure with no fallback. Opt-in via NB_NRPT_USE_UPSTREAM
+	// to keep the default behaviour unchanged.
+	useUpstream := false
+	if v := os.Getenv(envNRPTUseUpstream); v != "" {
+		if parsed, err := strconv.ParseBool(v); err != nil {
+			log.Warnf("failed to parse %s=%q: %v", envNRPTUseUpstream, v, err)
+		} else {
+			useUpstream = parsed
+		}
+	}
+
+	type matchGroup struct {
+		servers []netip.Addr
+		domains []string
+	}
+
+	var searchDomains []string
+	var matchGroups []matchGroup
+	groupIndex := make(map[string]int)
+	addMatch := func(servers []netip.Addr, namespace string) {
+		key := serverKey(servers)
+		if i, ok := groupIndex[key]; ok {
+			matchGroups[i].domains = append(matchGroups[i].domains, namespace)
+			return
+		}
+		groupIndex[key] = len(matchGroups)
+		matchGroups = append(matchGroups, matchGroup{servers: servers, domains: []string{namespace}})
+	}
+
 	for _, dConf := range config.Domains {
 		if dConf.Disabled {
 			continue
@@ -346,7 +387,11 @@ func (r *registryConfigurator) applyDNSConfig(config HostDNSConfig, stateManager
 		if !dConf.MatchOnly {
 			searchDomains = append(searchDomains, strings.TrimSuffix(dConf.Domain, "."))
 		}
-		matchDomains = append(matchDomains, "."+strings.TrimSuffix(dConf.Domain, "."))
+		servers := dConf.Upstreams
+		if !useUpstream || len(servers) == 0 {
+			servers = []netip.Addr{config.ServerIP}
+		}
+		addMatch(servers, "."+strings.TrimSuffix(dConf.Domain, "."))
 	}
 
 	// The root namespace is a match domain like any other: it just happens to
@@ -358,7 +403,7 @@ func (r *registryConfigurator) applyDNSConfig(config HostDNSConfig, stateManager
 		if parseBoolEnv(envLegacyDNSResolution) {
 			log.Infof("%s is set, leaving DNS resolution shared with the other adapters' resolvers instead of forcing it through %s", envLegacyDNSResolution, config.ServerIP)
 		} else {
-			matchDomains = append(matchDomains, nrptCatchAllNamespace)
+			addMatch([]netip.Addr{config.ServerIP}, nrptCatchAllNamespace)
 			log.Infof("routing every namespace through %s: DNS resolution is now exclusive to NetBird", config.ServerIP)
 
 			if err := r.addDNSExemptLocalPolicy(); err != nil {
@@ -367,10 +412,13 @@ func (r *registryConfigurator) applyDNSConfig(config HostDNSConfig, stateManager
 		}
 	}
 
-	if len(matchDomains) != 0 {
-		if err := r.addDNSMatchPolicy(matchDomains, config.ServerIP); err != nil {
+	ruleIndex := 0
+	for _, grp := range matchGroups {
+		nextIndex, err := r.addDNSMatchPolicy(grp.domains, grp.servers, ruleIndex)
+		if err != nil {
 			return fmt.Errorf("add dns match policy: %w", err)
 		}
+		ruleIndex = nextIndex
 	}
 
 	r.updateState(stateManager)
@@ -402,12 +450,13 @@ func (r *registryConfigurator) addDNSSetupForAll(ip netip.Addr) error {
 	return nil
 }
 
-func (r *registryConfigurator) addDNSMatchPolicy(domains []string, ip netip.Addr) error {
+func (r *registryConfigurator) addDNSMatchPolicy(domains []string, servers []netip.Addr, baseIndex int) (int, error) {
 	// if the gpo key is present, we need to put our DNS settings there, otherwise our config might be ignored
 	// see https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpnrpt/8cc31cb9-20cb-4140-9e85-3e08703b4745
 
 	// We need to batch domains into chunks and create one NRPT rule per batch.
-	ruleIndex := 0
+	ruleIndex := baseIndex
+	startIndex := baseIndex
 	for i := 0; i < len(domains); i += nrptMaxDomainsPerRule {
 		end := i + nrptMaxDomainsPerRule
 		if end > len(domains) {
@@ -418,13 +467,13 @@ func (r *registryConfigurator) addDNSMatchPolicy(domains []string, ip netip.Addr
 		localPath := fmt.Sprintf("%s-%d", dnsPolicyConfigMatchPath, ruleIndex)
 		gpoPath := fmt.Sprintf("%s-%d", gpoDnsPolicyConfigMatchPath, ruleIndex)
 
-		if err := r.configureDNSPolicy(localPath, batchDomains, ip); err != nil {
-			return fmt.Errorf("configure DNS Local policy for rule %d: %w", ruleIndex, err)
+		if err := r.configureDNSPolicy(localPath, batchDomains, servers); err != nil {
+			return ruleIndex, fmt.Errorf("configure DNS Local policy for rule %d: %w", ruleIndex, err)
 		}
 
 		if r.gpo {
-			if err := r.configureDNSPolicy(gpoPath, batchDomains, ip); err != nil {
-				return fmt.Errorf("configure gpo DNS policy for rule %d: %w", ruleIndex, err)
+			if err := r.configureDNSPolicy(gpoPath, batchDomains, servers); err != nil {
+				return ruleIndex, fmt.Errorf("configure gpo DNS policy for rule %d: %w", ruleIndex, err)
 			}
 		}
 
@@ -438,8 +487,18 @@ func (r *registryConfigurator) addDNSMatchPolicy(domains []string, ip netip.Addr
 		}
 	}
 
-	log.Infof("added %d NRPT rules for %d domains", ruleIndex, len(domains))
-	return nil
+	log.Infof("added %d NRPT rules for %d domains", ruleIndex-startIndex, len(domains))
+	return ruleIndex, nil
+}
+
+// serverKey returns a stable key for a nameserver set, used to group match
+// domains that share the same resolvers into a single NRPT rule.
+func serverKey(servers []netip.Addr) string {
+	parts := make([]string, 0, len(servers))
+	for _, s := range servers {
+		parts = append(parts, s.String())
+	}
+	return strings.Join(parts, ",")
 }
 
 // addDNSExemptLocalPolicy carves .local back out of the catch-all. RFC 6762
@@ -450,14 +509,12 @@ func (r *registryConfigurator) addDNSMatchPolicy(domains []string, ip netip.Addr
 // servers hands it back to the DNS client untouched. A more specific rule still
 // wins, so a match domain under .local keeps going through us.
 func (r *registryConfigurator) addDNSExemptLocalPolicy() error {
-	var noServers netip.Addr
-
-	if err := r.configureDNSPolicy(dnsPolicyConfigExemptLocalPath, []string{nrptLocalNamespace}, noServers); err != nil {
+	if err := r.configureDNSPolicy(dnsPolicyConfigExemptLocalPath, []string{nrptLocalNamespace}, nil); err != nil {
 		return fmt.Errorf("configure exempt policy for %s: %w", nrptLocalNamespace, err)
 	}
 
 	if r.gpo {
-		if err := r.configureDNSPolicy(gpoDnsPolicyConfigExemptLocalPath, []string{nrptLocalNamespace}, noServers); err != nil {
+		if err := r.configureDNSPolicy(gpoDnsPolicyConfigExemptLocalPath, []string{nrptLocalNamespace}, nil); err != nil {
 			return fmt.Errorf("configure gpo exempt policy for %s: %w", nrptLocalNamespace, err)
 		}
 		if err := refreshGroupPolicy(); err != nil {
@@ -478,7 +535,7 @@ func (r *registryConfigurator) addDNSExemptLocalPolicy() error {
 // as a no-op, keeps out of Get-DnsClientNrptPolicy -Effective, and ignores in
 // favour of the catch-all. 0x8 says the server list is the meaningful part of
 // the rule, and an empty list then means "no server, resolve normally".
-func (r *registryConfigurator) configureDNSPolicy(policyPath string, domains []string, ip netip.Addr) error {
+func (r *registryConfigurator) configureDNSPolicy(policyPath string, domains []string, servers []netip.Addr) error {
 	if err := removeRegistryKeyFromDNSPolicyConfig(policyPath); err != nil {
 		return fmt.Errorf("remove existing dns policy: %w", err)
 	}
@@ -497,11 +554,15 @@ func (r *registryConfigurator) configureDNSPolicy(policyPath string, domains []s
 		return fmt.Errorf("set %s: %w", dnsPolicyConfigNameKey, err)
 	}
 
-	var servers string
-	if ip.IsValid() {
-		servers = ip.String()
+	// GenericDNSServers is a space-delimited list; an empty value means the
+	// namespace is handed back to the OS resolver (used for the .local carve-out).
+	ips := make([]string, 0, len(servers))
+	for _, s := range servers {
+		if s.IsValid() {
+			ips = append(ips, s.String())
+		}
 	}
-	if err := regKey.SetStringValue(dnsPolicyConfigGenericDNSServersKey, servers); err != nil {
+	if err := regKey.SetStringValue(dnsPolicyConfigGenericDNSServersKey, strings.Join(ips, " ")); err != nil {
 		return fmt.Errorf("set %s: %w", dnsPolicyConfigGenericDNSServersKey, err)
 	}
 
