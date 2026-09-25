@@ -193,6 +193,80 @@ func ruleNamespaces(t *testing.T, path string) []string {
 	return names
 }
 
+// ruleServers returns the GenericDNSServers value of an NRPT rule key.
+func ruleServers(t *testing.T, path string) string {
+	t.Helper()
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, path, registry.QUERY_VALUE)
+	require.NoError(t, err, "rule key %s should exist", path)
+	defer k.Close()
+
+	servers, _, err := k.GetStringValue(dnsPolicyConfigGenericDNSServersKey)
+	require.NoError(t, err)
+	return servers
+}
+
+// TestNRPTUpstreamPerDomainGroup verifies that match domains carrying different
+// upstream nameservers are written as separate NRPT rules that point straight
+// at those nameservers instead of the in-memory resolver address.
+func TestNRPTUpstreamPerDomainGroup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping registry integration test in short mode")
+	}
+
+	defer cleanupRegistryKeys(t)
+	cleanupRegistryKeys(t)
+
+	t.Setenv(envNRPTUseUpstream, "true")
+
+	testGUID := "{12345678-1234-1234-1234-123456789ABC}"
+	interfacePath := InterfaceConfigPath + `\` + testGUID
+	testKey, _, err := registry.CreateKey(registry.LOCAL_MACHINE, interfacePath, registry.SET_VALUE)
+	require.NoError(t, err, "Should create test interface registry key")
+	require.NoError(t, testKey.Close(), "close test interface registry key")
+	defer func() {
+		assert.NoError(t, registry.DeleteKey(registry.LOCAL_MACHINE, interfacePath), "delete test interface registry key")
+	}()
+
+	cfg := &registryConfigurator{guid: testGUID}
+	upstreamA := netip.MustParseAddr("192.0.2.10")
+	upstreamB := netip.MustParseAddr("192.0.2.20")
+
+	config := HostDNSConfig{
+		ServerIP: netip.MustParseAddr("100.64.0.1"),
+		Domains: []DomainConfig{
+			{Domain: "a.example.com", MatchOnly: true, Upstreams: []netip.Addr{upstreamA}},
+			{Domain: "b.example.com", MatchOnly: true, Upstreams: []netip.Addr{upstreamB}},
+		},
+	}
+
+	require.NoError(t, cfg.applyDNSConfig(config, nil))
+
+	ruleA := fmt.Sprintf("%s-0", dnsPolicyConfigMatchPath)
+	ruleB := fmt.Sprintf("%s-1", dnsPolicyConfigMatchPath)
+
+	namesA := ruleNamespaces(t, ruleA)
+	assert.Contains(t, namesA, ".a.example.com")
+	assert.NotContains(t, namesA, ".b.example.com")
+	assert.Equal(t, upstreamA.String(), ruleServers(t, ruleA))
+
+	namesB := ruleNamespaces(t, ruleB)
+	assert.Contains(t, namesB, ".b.example.com")
+	assert.Equal(t, upstreamB.String(), ruleServers(t, ruleB))
+
+	assert.NotEqual(t, config.ServerIP.String(), ruleServers(t, ruleA),
+		"domain upstreams must replace the in-memory resolver address")
+
+	// With the switch off (default) every match domain keeps the in-memory
+	// resolver address, so the two domains share a single rule.
+	t.Setenv(envNRPTUseUpstream, "")
+	cleanupRegistryKeys(t)
+
+	require.NoError(t, cfg.applyDNSConfig(config, nil))
+	assert.Equal(t, config.ServerIP.String(), ruleServers(t, ruleA))
+	assert.Contains(t, ruleNamespaces(t, ruleA), ".a.example.com")
+	assert.Contains(t, ruleNamespaces(t, ruleA), ".b.example.com")
+}
+
 // TestNRPTCatchAllRuleLegacyEnv verifies that NB_USE_LEGACY_DNS_RESOLUTION
 // leaves the root namespace unclaimed, so no rule is written for a RouteAll
 // config that carries no match domains.
@@ -266,10 +340,11 @@ func TestNRPTCleanupWithoutRuleCount(t *testing.T) {
 	}
 
 	previousRun := &registryConfigurator{}
-	require.NoError(t, previousRun.addDNSMatchPolicy(domains, testIP))
+	_, err := previousRun.addDNSMatchPolicy(domains, []netip.Addr{testIP}, 0)
+	require.NoError(t, err)
 
 	// the unsuffixed key an older version would have written
-	require.NoError(t, previousRun.configureDNSPolicy(dnsPolicyConfigMatchPath, []string{".legacy.example.com"}, testIP))
+	require.NoError(t, previousRun.configureDNSPolicy(dnsPolicyConfigMatchPath, []string{".legacy.example.com"}, []netip.Addr{testIP}))
 
 	// a policy owned by someone else, which cleanup must not touch
 	foreignPath := DNSPolicyConfigRoot + `\DnsPolicyConfigTestForeign`

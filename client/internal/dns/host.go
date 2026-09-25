@@ -36,9 +36,10 @@ type HostDNSConfig struct {
 }
 
 type DomainConfig struct {
-	Disabled  bool   `json:"disabled"`
-	Domain    string `json:"domain"`
-	MatchOnly bool   `json:"matchOnly"`
+	Disabled  bool         `json:"disabled"`
+	Domain    string       `json:"domain"`
+	MatchOnly bool         `json:"matchOnly"`
+	Upstreams []netip.Addr `json:"upstreams,omitempty"`
 }
 
 type mockHostConfigurator struct {
@@ -100,10 +101,17 @@ func dnsConfigToHostDNSConfig(dnsConfig nbdns.Config, ip netip.Addr, port int) H
 			config.RouteAll = true
 		}
 
+		upstreams := make([]netip.Addr, 0, len(nsConfig.NameServers))
+		for _, ns := range nsConfig.NameServers {
+			if ns.IP.IsValid() {
+				upstreams = append(upstreams, ns.IP)
+			}
+		}
 		for _, domain := range nsConfig.Domains {
 			config.Domains = append(config.Domains, DomainConfig{
 				Domain:    strings.ToLower(dns.Fqdn(domain)),
 				MatchOnly: !nsConfig.SearchDomainsEnabled,
+				Upstreams: upstreams,
 			})
 		}
 	}
